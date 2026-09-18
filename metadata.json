@@ -1,0 +1,7 @@
+{
+  "name": "Substrate API & MCP Workflow Engine",
+  "description": "Browser extension and sidebar that observes website API traffic and data state changes to passively synthesize robust, zero-scraping MCP automations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
