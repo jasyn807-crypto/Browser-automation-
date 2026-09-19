@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "120",
+  "name": "Substrate Browser Agent",
+  "version": "0.1.0",
+  "description": "Observes API traffic and completes browser tasks by calling site APIs directly (CDP main-world execution) instead of clicking UIs.",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "debugger",
+    "scripting",
+    "webRequest",
+    "alarms"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Substrate Browser Agent"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

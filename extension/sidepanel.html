@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Substrate Agent</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0d10;
+        --panel: #12151a;
+        --border: #23272f;
+        --text: #e6e9ee;
+        --muted: #8b93a1;
+        --accent: #4f8cff;
+        --ok: #34d399;
+        --err: #f87171;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      header {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: var(--panel);
+      }
+      header .logo {
+        width: 22px; height: 22px; border-radius: 6px;
+        background: linear-gradient(135deg, #4f8cff, #9333ea);
+        flex: none;
+      }
+      header h1 { font-size: 13px; font-weight: 600; flex: 1; }
+      #status { font-size: 11px; color: var(--muted); }
+      #status.ok { color: var(--ok); }
+      #status.err { color: var(--err); }
+
+      #log {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .suggestion {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--accent);
+        border-radius: 10px;
+        padding: 10px 12px;
+        align-self: stretch;
+      }
+      .suggestion h3 { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+      .suggestion p { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+      .suggestion .stats { font-size: 10px; color: var(--muted); margin-bottom: 8px; }
+      .suggestion .stats b { color: var(--ok); }
+      .suggestion .row { display: flex; gap: 8px; }
+      .suggestion button {
+        font-size: 11px;
+        padding: 6px 10px;
+        border-radius: 6px;
+      }
+      .suggestion button.ghost {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--muted);
+      }
+      #suggestions-toggle {
+        margin: 0 12px 6px;
+        font-size: 11px;
+        color: var(--muted);
+        background: none;
+        border: none;
+        cursor: pointer;
+        text-align: left;
+        padding: 0;
+      }
+      .msg { max-width: 100%; padding: 8px 10px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; }
+      .msg.user { align-self: flex-end; background: #1d3a6e; }
+      .msg.agent { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
+      .msg.agent.result { border-color: var(--ok); }
+      .msg.error { align-self: flex-start; background: #3a1d1d; border: 1px solid #6b2c2c; color: var(--err); }
+      .msg .meta { font-size: 10px; color: var(--muted); margin-top: 4px; }
+      .msg .code {
+        display: block;
+        font: 11px/1.45 ui-monospace, "Cascadia Code", monospace;
+        background: #0b0d10;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        margin-top: 6px;
+        max-height: 160px;
+        overflow: auto;
+        white-space: pre;
+      }
+
+      form {
+        display: flex;
+        gap: 8px;
+        padding: 10px 12px;
+        border-top: 1px solid var(--border);
+        background: var(--panel);
+      }
+      input {
+        flex: 1;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 9px 11px;
+        font: inherit;
+        outline: none;
+      }
+      input:focus { border-color: var(--accent); }
+      button {
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 9px 14px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      #busy { display: none; padding: 6px 12px; font-size: 11px; color: var(--muted); background: var(--panel); }
+      #busy.on { display: block; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo"></div>
+      <h1>Substrate Agent</h1>
+      <span id="status">checking…</span>
+    </header>
+    <div id="log"></div>
+    <button id="suggestions-toggle">▸ Automation suggestions (0)</button>
+    <div id="suggestions" style="display:none; padding: 0 12px 8px; flex-direction:column; gap:8px;"></div>
+    <button id="tools-toggle">▸ Learned tools (0) — replay free, forever</button>
+    <div id="tools" style="display:none; padding: 0 12px 8px; flex-direction:column; gap:8px;"></div>
+    <div id="busy">running agent task… (debugger attached to active tab)</div>
+    <form id="composer">
+      <input id="instruction" placeholder="e.g. find and return the name of every project in this dashboard" autocomplete="off" />
+      <button id="send" type="submit">Run</button>
+    </form>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

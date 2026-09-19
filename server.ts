@@ -27,6 +27,75 @@ function getGenAI(): GoogleGenAI | null {
   return aiClient;
 }
 
+// ---------------------------------------------------------------------------
+// LLM provider layer: frellm (OpenAI-compatible local router) first, Gemini
+// fallback. The agent loop calls callLLM() and never cares which one answered.
+// ---------------------------------------------------------------------------
+
+const FREELLM_BASE_URL = process.env.FREELLM_BASE_URL || "";
+const FREELLM_MODEL = process.env.FREELLM_MODEL || "auto";
+const FREELLM_KEY = process.env.FREELLM_API_KEY || process.env.HERMES_CUSTOM_FREELLM_API_KEY || "";
+
+function frellmAvailable(): boolean {
+  return Boolean(FREELLM_BASE_URL && FREELLM_KEY);
+}
+
+async function callFrellm(systemPrompt: string, userPrompt: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${FREELLM_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${FREELLM_KEY}`,
+      },
+      body: JSON.stringify({
+        model: FREELLM_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.2,
+        max_tokens: 2048,
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`[agent] frellm HTTP ${res.status}`);
+      return null;
+    }
+    const data: any = await res.json();
+    const content = data?.choices?.[0]?.message?.content;
+    return typeof content === "string" ? content : null;
+  } catch (err: any) {
+    console.warn(`[agent] frellm call failed: ${err.message}`);
+    return null;
+  }
+}
+
+async function callGemini(systemPrompt: string, userPrompt: string): Promise<string | null> {
+  const ai = getGenAI();
+  if (!ai) return null;
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }] }],
+      config: { responseMimeType: "application/json", temperature: 0.2 },
+    });
+    return response.text ?? null;
+  } catch (err: any) {
+    console.warn(`[agent] gemini call failed: ${err.message}`);
+    return null;
+  }
+}
+
+// Unified: try frellm (local router, auto model) then Gemini.
+async function callLLM(systemPrompt: string, userPrompt: string): Promise<string | null> {
+  if (frellmAvailable()) {
+    const out = await callFrellm(systemPrompt, userPrompt);
+    if (out) return out;
+  }
+  return callGemini(systemPrompt, userPrompt);
+}
+
 // In-memory Billing & Credit Management State
 interface ServerBillingAccount {
   currentTierId: 'free_starter' | 'pro_operator' | 'business_team' | 'enterprise_scale';
@@ -926,6 +995,697 @@ app.post("/api/execute-mcp", async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Execution failed" });
   }
+});
+
+// ---------------------------------------------------------------------------
+// AGENT LOOP — the Pluno-style brain (see PLUNO_REVERSE_ENGINEERING.md §4)
+// Server plans, extension executes JS in the page MAIN world via CDP,
+// observations (code results + network evidence) flow back here.
+// ---------------------------------------------------------------------------
+
+interface AgentStep {
+  index: number;
+  thought: string;
+  action: { type: "execute_code" | "final" | "error"; javascript?: string; answer?: string; message?: string };
+}
+
+interface AgentRun {
+  id: string;
+  instruction: string;
+  page: { url: string; title: string };
+  history: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
+  steps: AgentStep[];
+  stepIndex: number;
+  startedAt: number;
+  finishedAt?: number;
+}
+
+const agentRuns = new Map<string, AgentRun>();
+const AGENT_MAX_STEPS = 10;
+
+const AGENT_SYSTEM_PROMPT = `You are Substrate, a browser automation agent. You complete tasks inside a web page by calling the site's own APIs with JavaScript — NOT by clicking UI elements.
+
+You control ONE tab. Each turn you receive either an initial page snapshot or the result of your last JavaScript execution.
+
+You MUST respond with ONLY a valid JSON object (no markdown fences, no prose outside JSON) in one of these shapes:
+
+1. To execute code in the page:
+{"thought": "one short sentence of reasoning", "action": {"type": "execute_code", "javascript": "const res = await fetch('/api/...'); return await res.json();"}}
+
+2. When the task is complete:
+{"thought": "one short sentence", "action": {"type": "final", "answer": "the final answer for the user, in plain text"}}
+
+3. If the task is impossible:
+{"thought": "one short sentence", "action": {"type": "error", "message": "why it is impossible"}}
+
+Rules for the javascript:
+- It runs in the page's MAIN world via Runtime.evaluate: same origin, same cookies, same session as the logged-in user.
+- It MUST be an async function body. Use fetch() with RELATIVE URLs (e.g. fetch('/api/entries')) so it hits the site's own backend with the user's credentials.
+- An injected helper exists: substrate.getPageSnapshot() returns a simplified DOM outline + visible page text. Use it when you need to see the page or find data attributes.
+- The return value MUST be JSON-serializable and small (under ~20KB). Trim/summarize large arrays.
+- Do not use alert/confirm/prompt. Do not navigate away (no location.href = ...).
+- Prefer the site's internal JSON APIs (discovered from network evidence and the page snapshot) over DOM text scraping.
+- If a fetch fails, inspect the error and try a different endpoint or method; check network evidence for the exact paths the site itself uses.
+
+Before your first execute_code, study the page snapshot carefully to identify likely API routes (script src, data attributes, or known product paths). When network evidence from the site's own XHRs is provided, mirror those exact requests (method, path, headers minus credentials).`;
+
+interface GeminiAction {
+  thought?: string;
+  action?: { type?: string; javascript?: string; answer?: string; message?: string };
+}
+
+function extractJson(text: string): GeminiAction | null {
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch { return null; }
+    }
+    return null;
+  }
+}
+
+function normalizeAction(parsed: GeminiAction): AgentStep["action"] {
+  const a = parsed.action ?? {};
+  if (a.type === "execute_code" && typeof a.javascript === "string" && a.javascript.trim()) {
+    return { type: "execute_code", javascript: a.javascript };
+  }
+  if (a.type === "final" && typeof a.answer === "string") {
+    return { type: "final", answer: a.answer };
+  }
+  if (a.type === "error" && typeof a.message === "string") {
+    return { type: "error", message: a.message };
+  }
+  return { type: "error", message: "Model returned an invalid action shape." };
+}
+
+function renderObservation(observation: any): string {
+  if (!observation || typeof observation !== "object") return "Empty observation.";
+  if (observation.kind === "page_snapshot") {
+    return observation.ok
+      ? `Initial page snapshot:\n${observation.snapshot}`
+      : `Failed to capture page snapshot: ${observation.error}`;
+  }
+  if (observation.kind === "code_result") {
+    const parts: string[] = [];
+    parts.push(observation.ok ? "Code executed successfully." : `Code failed: ${observation.exception?.message ?? "unknown"}`);
+    if (observation.result !== null && observation.result !== undefined) {
+      parts.push(`Result: ${JSON.stringify(observation.result).slice(0, 6000)}`);
+    }
+    if (observation.console?.length) {
+      parts.push(`Console:\n${observation.console.slice(0, 10).map((c: any) => `[${c.level}] ${c.args?.join(" ")}`).join("\n").slice(0, 2000)}`);
+    }
+    if (observation.networkEvidence?.length) {
+      const net = observation.networkEvidence
+        .filter((e: any) => e.resourceType === "xmlhttprequest" || e.resourceType === "fetch")
+        .map((e: any) => `${e.method} ${e.url} -> ${e.statusCode ?? "…"} (type=${e.resourceType})`)
+        .slice(0, 25);
+      if (net.length) parts.push(`Recent XHR/fetch traffic observed on this page (mirror these calls):\n${net.join("\n")}`);
+    }
+    return parts.join("\n\n");
+  }
+  return JSON.stringify(observation).slice(0, 3000);
+}
+
+async function callAgentModel(run: AgentRun, observationText: string): Promise<AgentStep> {
+  run.history.push({ role: "tool", content: observationText.slice(0, 24000) });
+  const stepIndex = run.stepIndex;
+
+  // Conversation transcript for the model
+  const transcript = run.history
+    .slice(0, -1)
+    .map((m) => `[${m.role}] ${m.content.slice(0, 12000)}`)
+    .join("\n\n")
+    .slice(-40000);
+  const userPrompt = `TASK: ${run.instruction}\n\nPAGE: ${run.page.url} (${run.page.title})\n\nTRANSCRIPT SO FAR:\n${transcript || "(none)"}\n\nLATEST OBSERVATION:\n${observationText.slice(0, 24000)}\n\nRespond with your next action as JSON.`;
+
+  const raw = await callLLM(AGENT_SYSTEM_PROMPT, userPrompt);
+  const parsed = raw ? extractJson(raw) : null;
+  if (parsed) {
+    const step: AgentStep = { index: stepIndex, thought: parsed.thought ?? "", action: normalizeAction(parsed) };
+    run.history.push({ role: "assistant", content: JSON.stringify(step.action).slice(0, 8000) });
+    run.steps.push(step);
+    run.stepIndex++;
+    return step;
+  }
+
+  // Offline / provider-failure fallback: deterministic snapshot demo
+  if (stepIndex === 0) {
+    const step: AgentStep = {
+      index: 0,
+      thought: "No LLM available — falling back to a snapshot-only demo step.",
+      action: { type: "execute_code", javascript: "return substrate.getPageSnapshot();" },
+    };
+    run.steps.push(step);
+    run.stepIndex++;
+    return step;
+  }
+  const step: AgentStep = {
+    index: stepIndex,
+    thought: "Demo complete (no LLM — returning last observation as the answer).",
+    action: { type: "final", answer: observationText.slice(0, 2000) },
+  };
+  run.steps.push(step);
+  run.stepIndex++;
+  return step;
+}
+
+// Start a run: returns the runId the extension will use for /api/agent/step
+app.post("/api/agent/start", (req, res) => {
+  const { instruction, page } = req.body ?? {};
+  if (!instruction || !page?.url) {
+    return res.status(400).json({ ok: false, error: "instruction and page.url are required" });
+  }
+  const run: AgentRun = {
+    id: crypto.randomUUID(),
+    instruction: String(instruction).slice(0, 2000),
+    page: { url: String(page.url).slice(0, 500), title: String(page.title ?? "").slice(0, 200) },
+    history: [],
+    steps: [],
+    stepIndex: 0,
+    startedAt: Date.now(),
+  };
+  agentRuns.set(run.id, run);
+  res.json({ ok: true, runId: run.id });
+});
+
+// Feed an observation, get the next action (execute_code | final | error)
+app.post("/api/agent/step", async (req, res) => {
+  try {
+    const { runId, observation } = req.body ?? {};
+    const run = agentRuns.get(runId);
+    if (!run) return res.status(404).json({ ok: false, error: "Unknown runId" });
+    if (run.stepIndex >= AGENT_MAX_STEPS) {
+      return res.json({
+        ok: true,
+        step: { index: run.stepIndex, thought: "Step limit reached.", action: { type: "error", message: "Step limit reached without a final answer." } },
+        next: { type: "error", message: "Step limit reached." },
+      });
+    }
+    const step = await callAgentModel(run, renderObservation(observation));
+    // 'next' mirrors the action for the extension's loop; include javascript/answer/message
+    const next: any = { type: step.action.type };
+    if (step.action.type === "execute_code") next.javascript = step.action.javascript;
+    if (step.action.type === "final") next.answer = step.action.answer;
+    if (step.action.type === "error") next.message = step.action.message;
+    if (step.action.type !== "execute_code") run.finishedAt = Date.now();
+    res.json({ ok: true, step, next });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message || "agent step failed" });
+  }
+});
+
+// Introspection for the web dashboard
+app.get("/api/agent/runs", (_req, res) => {
+  res.json({
+    ok: true,
+    runs: [...agentRuns.values()].map((r) => ({
+      id: r.id,
+      instruction: r.instruction,
+      page: r.page,
+      status: r.finishedAt ? "finished" : "in-progress",
+      steps: r.steps.length,
+      startedAt: r.startedAt,
+      finishedAt: r.finishedAt ?? null,
+    })),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BEHAVIOR ANALYSIS — activity ingestion, repetition detection, suggestions
+// (Pluno's "learns how you work" feature, server side)
+// ---------------------------------------------------------------------------
+
+interface ActivityEvent {
+  type: string; // click | form_submit | field_change | file_selected | enter | navigation
+  at: number;
+  url: string;
+  role: string;
+  name: string;
+  ancestors: string[];
+  tabOrigin?: string;
+}
+
+const activityLog: ActivityEvent[] = [];
+const ACTIVITY_LOG_MAX = 20000;
+
+interface Suggestion {
+  id: string;
+  title: string;
+  summary: string;
+  triggerDescription: string;
+  instruction: string; // what we send to the agent loop when the user runs it
+  targetSite: string;
+  estimatedMinutesSaved: number;
+  occurrences: number;
+  createdAt: number;
+  dismissed?: boolean;
+}
+
+const suggestions = new Map<string, Suggestion>();
+let suggestionScanRunning = false;
+
+app.post("/api/activity/ingest", (req, res) => {
+  const { events } = req.body ?? {};
+  if (!Array.isArray(events) || events.length === 0) {
+    return res.status(400).json({ ok: false, error: "events[] required" });
+  }
+  let stored = 0;
+  for (const e of events.slice(0, 2000)) {
+    if (typeof e?.type === "string" && typeof e?.at === "number" && typeof e?.url === "string") {
+      const o = originOf(e.url);
+      if (blockedOrigins.has(o)) continue; // per-origin recording control
+      activityLog.push({
+        type: e.type,
+        at: e.at,
+        url: String(e.url).slice(0, 500),
+        role: String(e.role ?? "").slice(0, 40),
+        name: String(e.name ?? "").slice(0, 60),
+        ancestors: Array.isArray(e.ancestors) ? e.ancestors.slice(0, 5).map(String) : [],
+        tabOrigin: e.tabOrigin ? String(e.tabOrigin).slice(0, 100) : undefined,
+      });
+      stored++;
+    }
+  }
+  if (activityLog.length > ACTIVITY_LOG_MAX) {
+    activityLog.splice(0, activityLog.length - ACTIVITY_LOG_MAX);
+  }
+  res.json({ ok: true, stored, total: activityLog.length });
+});
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "unknown";
+  }
+}
+
+// Turn raw events into a per-origin interaction sequence: "click button:Save",
+// "form_submit form:Search", etc. — same shape Pluno's cloud uses to spot
+// repeated workflows.
+function buildInteractionSequences(): Map<string, string[]> {
+  const byOrigin = new Map<string, string[]>();
+  for (const e of activityLog) {
+    const o = originOf(e.url);
+    if (o === "unknown") continue;
+    const seq = byOrigin.get(o) ?? [];
+    const target = e.name ? `${e.role}:${e.name}` : e.role;
+    seq.push(`${e.type} ${target}`);
+    byOrigin.set(o, seq);
+  }
+  return byOrigin;
+}
+
+// Find repeated n-grams (n = 2..6) per origin — the "you keep doing this"
+// signal. Returns the most-repeated sequences with counts.
+function findRepetitions(seq: string[], minCount = 3): Array<{ pattern: string[]; count: number }> {
+  const found: Array<{ pattern: string[]; count: number }> = [];
+  for (let n = 2; n <= 6; n++) {
+    const counts = new Map<string, { count: number; pattern: string[] }>();
+    for (let i = 0; i + n <= seq.length; i++) {
+      const pat = seq.slice(i, i + n);
+      const key = pat.join(" | ");
+      const entry = counts.get(key) ?? { count: 0, pattern: pat };
+      entry.count++;
+      counts.set(key, entry);
+    }
+    for (const { count, pattern } of counts.values()) {
+      if (count >= minCount) found.push({ pattern, count });
+    }
+  }
+  // Deduplicate: drop patterns fully contained in a longer kept pattern
+  found.sort((a, b) => b.pattern.length - a.pattern.length || b.count - a.count);
+  const kept: Array<{ pattern: string[]; count: number }> = [];
+  for (const f of found) {
+    const sub = kept.some((k) => k.pattern.join(" | ").includes(f.pattern.join(" | ")));
+    if (!sub) kept.push(f);
+    if (kept.length >= 6) break;
+  }
+  return kept;
+}
+
+const SUGGESTION_PROMPT = `You analyze a user's repeated browser interaction patterns and propose ONE automation that would save them real time. The automation will be executed by a browser agent that can call the website's own APIs with JavaScript (same login, same session) — no UI clicking, no scraping.
+
+Respond with ONLY a valid JSON object:
+{"title": "short imperative title", "summary": "1-2 sentences: what repeats and what the automation does", "triggerDescription": "when/what triggers this (e.g. 'when you open the orders page and filter by pending')", "instruction": "a complete task instruction for the browser agent: mention the site, the exact repeated actions observed, and the desired outcome", "estimatedMinutesSaved": 12}
+
+Rules:
+- Base everything strictly on the observed pattern. Do not invent actions that aren't in the data.
+- estimatedMinutesSaved: occurrences × plausible minutes per repetition, rounded.
+- If the pattern is too trivial to automate (single navigation, plain link clicks with no follow-up work), return {"skip": true} instead.`;
+
+interface SuggestionLLMOut {
+  title?: string;
+  summary?: string;
+  triggerDescription?: string;
+  instruction?: string;
+  estimatedMinutesSaved?: number;
+  skip?: boolean;
+}
+
+function extractSuggestionJson(text: string): SuggestionLLMOut | null {
+  const cleaned = (text ?? "").replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch { return null; }
+    }
+    return null;
+  }
+}
+
+async function scanForSuggestions(): Promise<number> {
+  if (suggestionScanRunning) return 0;
+  suggestionScanRunning = true;
+  let created = 0;
+  try {
+    const sequences = buildInteractionSequences();
+    const existingPatterns = new Set([...suggestions.values()].map((s) => s.triggerDescription));
+    for (const [origin, seq] of sequences) {
+      const reps = findRepetitions(seq);
+      if (reps.length === 0) continue;
+      const top = reps[0];
+      const patternKey = top.pattern.join(" | ");
+      if (existingPatterns.has(patternKey)) continue;
+      const userPrompt = `Site: ${origin}
+Observed repeated interaction pattern (${top.count} times):
+${top.pattern.map((p) => "  " + p).join("\n")}
+
+Full recent interaction history on this site (truncated):
+${seq.slice(-80).map((p) => "  " + p).join("\n")}
+
+Propose the best automation for this pattern (or {"skip": true} if trivial).`;
+      const raw = await callLLM(SUGGESTION_PROMPT, userPrompt);
+      const out = raw ? extractSuggestionJson(raw) : null;
+      if (out && !out.skip && out.title && out.instruction) {
+        const s: Suggestion = {
+          id: crypto.randomUUID(),
+          title: String(out.title).slice(0, 120),
+          summary: String(out.summary ?? "").slice(0, 400),
+          triggerDescription: patternKey,
+          instruction: String(out.instruction).slice(0, 2000),
+          targetSite: origin,
+          estimatedMinutesSaved: Number(out.estimatedMinutesSaved) || 10,
+          occurrences: top.count,
+          createdAt: Date.now(),
+        };
+        suggestions.set(s.id, s);
+        existingPatterns.add(patternKey);
+        created++;
+      }
+    }
+  } finally {
+    suggestionScanRunning = false;
+  }
+  return created;
+}
+
+app.get("/api/suggestions", async (_req, res) => {
+  // Opportunistic scan: run analysis when we have enough fresh activity
+  const needsScan =
+    activityLog.length >= 30 &&
+    [...suggestions.values()].every((s) => Date.now() - s.createdAt > 10 * 60 * 1000 || s.dismissed);
+  if (needsScan) await scanForSuggestions();
+  const live = [...suggestions.values()].filter((s) => !s.dismissed).sort((a, b) => b.occurrences - a.occurrences);
+  res.json({ ok: true, suggestions: live, activityEvents: activityLog.length });
+});
+
+app.post("/api/suggestions/:id/dismiss", (req, res) => {
+  const s = suggestions.get(req.params.id);
+  if (!s) return res.status(404).json({ ok: false, error: "Unknown suggestion" });
+  s.dismissed = true;
+  res.json({ ok: true });
+});
+
+app.get("/api/activity/summary", (_req, res) => {
+  const sequences = buildInteractionSequences();
+  res.json({
+    ok: true,
+    totalEvents: activityLog.length,
+    byOrigin: Object.fromEntries([...sequences.entries()].map(([o, seq]) => [o, seq.length])),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LEARNED TOOL LIBRARY + REPLAY ENGINE + SCHEDULER + MCP + RECEIPTS
+// The "better than Pluno" layer: LLM learns a workflow once, then it replays
+// deterministically with ZERO LLM calls, on a schedule, verifiable, and
+// exposed to external agents over MCP.
+// ---------------------------------------------------------------------------
+
+interface LearnedTool {
+  id: string;
+  name: string; // slug, e.g. hubspot-export-pending-deals
+  description: string;
+  origin: string;
+  instruction: string;
+  code: string; // frozen JS — executes in page MAIN world via CDP (deterministic)
+  scheduleEveryMinutes: number | null;
+  nextRunAt: number | null;
+  runs: number;
+  llmFreeRuns: number; // replays that cost zero LLM calls
+  consecutiveFailures: number;
+  needsRelearn: boolean;
+  createdAt: number;
+  lastRunAt: number | null;
+  lastStatus: "never" | "ok" | "failed";
+  lastReceipt?: any;
+}
+
+const learnedTools = new Map<string, LearnedTool>();
+
+interface ReplayJob { id: string; toolId: string; createdAt: number; status: "queued" | "done" | "failed"; result?: any; }
+const replayJobs = new Map<string, ReplayJob>();
+
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
+}
+
+// FREEZE: turn a completed agent run's successful code steps into a replayable tool.
+// Called automatically after every successful run.
+app.post("/api/tools/freeze", (req, res) => {
+  const { runId, name, description } = req.body ?? {};
+  const run = agentRuns.get(runId);
+  if (!run) return res.status(404).json({ ok: false, error: "Unknown runId" });
+  const execSteps = run.steps.filter((s) => s.action.type === "execute_code");
+  if (execSteps.length === 0) {
+    return res.status(400).json({ ok: false, error: "Run had no executable steps — nothing to freeze" });
+  }
+  // Freeze the FULL successful sequence as one script: each step's code joined,
+  // with each step's result assigned to named vars so later steps can use them.
+  const code = execSteps.map((s, i) => `const __step${i} = await (async () => { ${s.action.javascript} })();`).join("\n") +
+    `\nreturn { ${execSteps.map((_, i) => `step${i}: __step${i}`).join(", ")} };`;
+  // Avoid duplicates by instruction+origin
+  for (const t of learnedTools.values()) {
+    if (t.instruction === run.instruction && t.origin === originOf(run.page.url)) {
+      t.code = code; // refresh with the latest successful sequence
+      t.needsRelearn = false;
+      return res.json({ ok: true, tool: t, updated: true });
+    }
+  }
+  const tool: LearnedTool = {
+    id: crypto.randomUUID(),
+    name: slugify(name || run.instruction).slice(0, 60) || "learned-tool",
+    description: String(description || run.instruction).slice(0, 400),
+    origin: originOf(run.page.url),
+    instruction: run.instruction,
+    code,
+    scheduleEveryMinutes: null,
+    nextRunAt: null,
+    runs: 0,
+    llmFreeRuns: 0,
+    consecutiveFailures: 0,
+    needsRelearn: false,
+    createdAt: Date.now(),
+    lastRunAt: null,
+    lastStatus: "never",
+  };
+  learnedTools.set(tool.id, tool);
+  res.json({ ok: true, tool });
+});
+
+app.get("/api/tools", (_req, res) => {
+  res.json({ ok: true, tools: [...learnedTools.values()] });
+});
+
+app.delete("/api/tools/:id", (req, res) => {
+  const ok = learnedTools.delete(req.params.id);
+  res.json({ ok });
+});
+
+// REPLAY PLAN: returns the frozen code + verification spec for the extension
+// to execute deterministically. ZERO LLM calls on this path.
+app.get("/api/tools/:id/replay", (req, res) => {
+  const t = learnedTools.get(req.params.id);
+  if (!t) return res.status(404).json({ ok: false, error: "Unknown tool" });
+  res.json({
+    ok: true,
+    tool: { id: t.id, name: t.name, origin: t.origin, instruction: t.instruction },
+    code: t.code,
+    verification: {
+      // Receipt spec: snapshot before + after; server diffs them on receipt.
+      captureBefore: "return substrate.getPageSnapshot();",
+      captureAfter: "return substrate.getPageSnapshot();",
+    },
+  });
+});
+
+// RECEIPT: extension reports replay result + before/after snapshots; server
+// computes the verification diff and stores the receipt. Self-healing trigger.
+app.post("/api/tools/:id/receipt", (req, res) => {
+  const t = learnedTools.get(req.params.id);
+  if (!t) return res.status(404).json({ ok: false, error: "Unknown tool" });
+  const { ok, result, exception, beforeSnapshot, afterSnapshot } = req.body ?? {};
+  t.runs++;
+  t.lastRunAt = Date.now();
+
+  // Verification diff: changed lines between before/after snapshots
+  let diff: string[] = [];
+  if (typeof beforeSnapshot === "string" && typeof afterSnapshot === "string") {
+    const b = new Set(beforeSnapshot.split("\n"));
+    const a = new Set(afterSnapshot.split("\n"));
+    diff = [...a].filter((l) => !b.has(l) && l.trim()).slice(0, 15);
+  }
+  const verified = ok === true && diff.length > 0;
+
+  if (ok === true) {
+    t.lastStatus = "ok";
+    t.llmFreeRuns++; // deterministic replay — no LLM cost
+    t.consecutiveFailures = 0;
+  } else {
+    t.lastStatus = "failed";
+    t.consecutiveFailures++;
+    if (t.consecutiveFailures >= 2) t.needsRelearn = true; // self-healing trigger
+  }
+  t.lastReceipt = {
+    at: Date.now(),
+    ok: ok === true,
+    verified, // state provably changed
+    changedLines: diff,
+    result: result ?? null,
+    exception: exception ?? null,
+    llmCalls: 0,
+  };
+  // Advance schedule
+  if (t.scheduleEveryMinutes) t.nextRunAt = Date.now() + t.scheduleEveryMinutes * 60000;
+  res.json({ ok: true, receipt: t.lastReceipt });
+});
+
+// SCHEDULE: set/clear a tool's schedule
+app.post("/api/tools/:id/schedule", (req, res) => {
+  const t = learnedTools.get(req.params.id);
+  if (!t) return res.status(404).json({ ok: false, error: "Unknown tool" });
+  const every = Number(req.body?.everyMinutes);
+  if (!every || every < 1) {
+    t.scheduleEveryMinutes = null;
+    t.nextRunAt = null;
+  } else {
+    t.scheduleEveryMinutes = every;
+    t.nextRunAt = Date.now() + every * 60000;
+  }
+  res.json({ ok: true, tool: { id: t.id, scheduleEveryMinutes: t.scheduleEveryMinutes, nextRunAt: t.nextRunAt } });
+});
+
+// DUE: tools whose scheduled run is due (+ relearn queue) — extension polls this
+app.get("/api/tools/due", (_req, res) => {
+  const now = Date.now();
+  const due = [...learnedTools.values()].filter((t) => t.scheduleEveryMinutes && t.nextRunAt && t.nextRunAt <= now);
+  for (const t of due) t.nextRunAt = now + (t.scheduleEveryMinutes ?? 0) * 60000; // claim
+  res.json({ ok: true, tools: due.map(({ code, ...rest }) => rest) });
+});
+
+// MCP SERVER (JSON-RPC 2.0 over HTTP): exposes learned tools to external
+// agents (Hermes, Claude, anything MCP-capable). tools/call queues a replay
+// job the extension executes; caller polls /api/jobs/:id for the result.
+app.post("/mcp", async (req, res) => {
+  const { jsonrpc, id, method, params } = req.body ?? {};
+  const reply = (result: any) => res.json({ jsonrpc: "2.0", id, result });
+  const replyErr = (code: number, message: string) => res.status(200).json({ jsonrpc: "2.0", id, error: { code, message } });
+
+  if (method === "initialize") {
+    return reply({ protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "substrate-learned-tools", version: "0.1.0" } });
+  }
+  if (method === "tools/list") {
+    return reply({
+      tools: [...learnedTools.values()].map((t) => ({
+        name: t.name,
+        description: `${t.description}${t.needsRelearn ? " (needs relearn — will use LLM)" : " (deterministic replay, zero LLM)"}`,
+        inputSchema: { type: "object", properties: { result_format: { type: "string", description: "'summary' or 'full'" } } },
+      })),
+    });
+  }
+  if (method === "tools/call") {
+    const tool = [...learnedTools.values()].find((t) => t.name === params?.name);
+    if (!tool) return replyErr(-32602, `Unknown tool: ${params?.name}`);
+    const job: ReplayJob = { id: crypto.randomUUID(), toolId: tool.id, createdAt: Date.now(), status: "queued" };
+    replayJobs.set(job.id, job);
+    return reply({
+      content: [{ type: "text", text: `Queued replay of "${tool.name}" (job ${job.id}). Poll GET /api/jobs/${job.id} for the result — the browser extension executes it within ~60s.` }],
+      jobUrl: `/api/jobs/${job.id}`,
+    });
+  }
+  return replyErr(-32601, `Unknown method: ${method}`);
+});
+
+app.get("/api/jobs/queued", (_req, res) => {
+  const queued = [...replayJobs.values()].filter((j) => j.status === "queued");
+  res.json({ ok: true, jobs: queued });
+});
+
+app.get("/api/jobs/:id", (req, res) => {
+  const j = replayJobs.get(req.params.id);
+  if (!j) return res.status(404).json({ ok: false, error: "Unknown job" });
+  res.json({ ok: true, job: j });
+});
+
+// Extension reports job completion
+app.post("/api/jobs/:id/complete", (req, res) => {
+  const j = replayJobs.get(req.params.id);
+  if (!j) return res.status(404).json({ ok: false, error: "Unknown job" });
+  j.status = req.body?.ok ? "done" : "failed";
+  j.result = req.body?.result ?? null;
+  res.json({ ok: true });
+});
+
+// PER-ORIGIN RECORDING CONTROLS (blocked origins are dropped on ingest)
+const blockedOrigins = new Set<string>();
+
+app.get("/api/settings/origins", (_req, res) => {
+  res.json({ ok: true, blocked: [...blockedOrigins] });
+});
+
+app.post("/api/settings/origins/block", (req, res) => {
+  const o = String(req.body?.origin ?? "").toLowerCase();
+  if (o) blockedOrigins.add(o);
+  res.json({ ok: true, blocked: [...blockedOrigins] });
+});
+
+app.post("/api/settings/origins/unblock", (req, res) => {
+  blockedOrigins.delete(String(req.body?.origin ?? "").toLowerCase());
+  res.json({ ok: true, blocked: [...blockedOrigins] });
+});
+
+// RELEARN: self-healing — re-run the agent loop for a tool's instruction,
+// then refresh the frozen code on success.
+app.post("/api/tools/:id/relearn", async (req, res) => {
+  const t = learnedTools.get(req.params.id);
+  if (!t) return res.status(404).json({ ok: false, error: "Unknown tool" });
+  const run: AgentRun = {
+    id: crypto.randomUUID(),
+    instruction: `Re-learn this automation for ${t.origin}: ${t.instruction}. The previous API sequence stopped working — find the current way.`,
+    page: { url: `https://${t.origin}/`, title: t.origin },
+    history: [],
+    steps: [],
+    stepIndex: 0,
+    startedAt: Date.now(),
+  };
+  agentRuns.set(run.id, run);
+  res.json({ ok: true, runId: run.id, note: "Extension drives the relearn via /api/agent/step; freeze the result with /api/tools/freeze" });
 });
 
 async function startServer() {
